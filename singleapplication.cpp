@@ -46,6 +46,7 @@
 #include "singleapplication.h"
 #include "singleapplication_p.h"
 
+#define MAX_INIT_LEN 128
 
 SingleApplicationPrivate::SingleApplicationPrivate( SingleApplication *q_ptr ) : q_ptr( q_ptr ) {
     server = nullptr;
@@ -216,6 +217,9 @@ void SingleApplicationPrivate::connectToPrimary( int msecs, ConnectionType conne
         quint16 checksum = qChecksum(initMsg.constData(), static_cast<quint32>(initMsg.length()));
         writeStream << checksum;
 
+        // make sure the message is within the limit
+        Q_ASSERT(initMsg.length() <= MAX_INIT_LEN);
+
         // The header indicates the message length that follows
         QByteArray header;
         QDataStream headerStream(&header, QIODevice::WriteOnly);
@@ -289,39 +293,58 @@ void SingleApplicationPrivate::slotConnectionEstablished()
         quint64 msgLen = 0;
         headerStream >> msgLen;
 
-        if (msgLen >= sizeof(quint16)) {
-           // Read the message body
-           QByteArray msgBytes = nextConnSocket->read(msgLen);
-           QDataStream readStream(msgBytes);
-           readStream.setVersion(QDataStream::Qt_5_6);
+        // Check that message length is legit. We need at least two bytes for
+        // the checksum. A typical init message is 55 bytes, so a limit of 128 is.
+        if( msgLen < sizeof(quint16) || msgLen > MAX_INIT_LEN ) {
+            nextConnSocket->close();
+            nextConnSocket->deleteLater();
+            return;
+        }
 
-           // server name
-           QByteArray latin1Name;
-           readStream >> latin1Name;
+        // make sure the message body is available
+        if( nextConnSocket->bytesAvailable() < msgLen ) {
+            nextConnSocket->waitForReadyRead(100);
+            if( nextConnSocket->bytesAvailable() < msgLen ) {
+                // Still not good
+                nextConnSocket->close();
+                nextConnSocket->deleteLater();
+                return;
+            }
+        }
 
-           // connection type
-           quint8 connType = InvalidConnection;
-           readStream >> connType;
-           connectionType = static_cast<ConnectionType>(connType);
+        // Read the message body
+        QByteArray msgBytes = nextConnSocket->read(msgLen);
+        QDataStream readStream(msgBytes);
+        readStream.setVersion(QDataStream::Qt_5_6);
 
-           // instance id
-           readStream >> instanceId;
+        // server name
+        QByteArray latin1Name;
+        readStream >> latin1Name;
 
-           // checksum
-           quint16 msgChecksum = 0;
-           readStream >> msgChecksum;
+        // connection type
+        quint8 connType = InvalidConnection;
+        readStream >> connType;
+        connectionType = static_cast<ConnectionType>(connType);
 
-           const quint16 actualChecksum = qChecksum(msgBytes.constData(), static_cast<quint32>(msgBytes.length() - sizeof(quint16)));
+        // instance id
+        readStream >> instanceId;
 
-           if (readStream.status() != QDataStream::Ok || QLatin1String(latin1Name) != blockServerName || msgChecksum != actualChecksum) {
-             connectionType = InvalidConnection;
-           }
+        // checksum
+        quint16 msgChecksum = 0;
+        readStream >> msgChecksum;
+
+        const quint16 actualChecksum = qChecksum(msgBytes.constData(), static_cast<quint32>(msgBytes.length() - sizeof(quint16)));
+
+        if( readStream.status() != QDataStream::Ok ||
+            QLatin1String(latin1Name) != blockServerName ||
+            msgChecksum != actualChecksum ) {
+            connectionType = InvalidConnection;
         }
     }
 
     if( connectionType == InvalidConnection ) {
         nextConnSocket->close();
-        delete nextConnSocket;
+        nextConnSocket->deleteLater();
         return;
     }
 
